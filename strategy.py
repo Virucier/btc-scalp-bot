@@ -2,10 +2,6 @@ import pandas as pd
 from indicators import calculate_ema, detect_swing_highs_lows, check_liquidity_sweep
 
 def analyze_btc_signal(df_15m: pd.DataFrame, df_1h: pd.DataFrame, capital: float = 5.0) -> dict | None:
-    """
-    Main strategy logic for BTC scalping.
-    Returns a signal dict or None if no good setup.
-    """
     if len(df_15m) < 50:
         return None
 
@@ -27,24 +23,20 @@ def analyze_btc_signal(df_15m: pd.DataFrame, df_1h: pd.DataFrame, capital: float
 
     sweep = check_liquidity_sweep(df_15m, current_price, lookback=25)
 
-    near_ema9 = abs(current_price - ema9) / current_price < 0.0035
-    near_ema21 = abs(current_price - ema21) / current_price < 0.005
-
-    avg_volume = df_15m['volume'].tail(20).mean()
-    current_volume = df_15m['volume'].iloc[-1]
-    volume_ok = current_volume > (avg_volume * 1.1)
+    # === On élargit un peu la tolérance du retest ===
+    near_ema9 = abs(current_price - ema9) / current_price < 0.0055   # 0.55% au lieu de 0.35%
+    near_ema21 = abs(current_price - ema21) / current_price < 0.0065
 
     signal = None
 
     # LONG SETUP
     if (bias == "long" and 
         sweep == "long_sweep" and 
-        (near_ema9 or near_ema21) and 
-        volume_ok):
+        (near_ema9 or near_ema21)):
 
         sl_price = min(df_15m['low'].iloc[-3], ema21) * 0.998
         tp1 = current_price + (current_price - sl_price) * 1.6
-        tp2 = current_price + (current_price - sl_price) * 2.8
+        tp2 = current_price + (current_price - sl_price) * 2.5
 
         risk_percent = 0.01
         risk_amount = capital * risk_percent
@@ -61,21 +53,20 @@ def analyze_btc_signal(df_15m: pd.DataFrame, df_1h: pd.DataFrame, capital: float
             "tp1": round(tp1, 1),
             "tp2": round(tp2, 1),
             "rr1": 1.6,
-            "rr2": 2.8,
+            "rr2": 2.5,
             "suggested_lot": max(suggested_lot, 0.001),
             "risk_usdt": round(risk_amount, 2),
-            "reason": "Liquidity sweep bas + Retest EMA + Volume + Bias haussier H1"
+            "reason": "Liquidity sweep + Retest EMA + Bias haussier H1"
         }
 
     # SHORT SETUP
     elif (bias == "short" and 
           sweep == "short_sweep" and 
-          (near_ema9 or near_ema21) and 
-          volume_ok):
+          (near_ema9 or near_ema21)):
 
         sl_price = max(df_15m['high'].iloc[-3], ema21) * 1.002
         tp1 = current_price - (sl_price - current_price) * 1.6
-        tp2 = current_price - (sl_price - current_price) * 2.8
+        tp2 = current_price - (sl_price - current_price) * 2.5
 
         risk_percent = 0.01
         risk_amount = capital * risk_percent
@@ -92,10 +83,10 @@ def analyze_btc_signal(df_15m: pd.DataFrame, df_1h: pd.DataFrame, capital: float
             "tp1": round(tp1, 1),
             "tp2": round(tp2, 1),
             "rr1": 1.6,
-            "rr2": 2.8,
+            "rr2": 2.5,
             "suggested_lot": max(suggested_lot, 0.001),
             "risk_usdt": round(risk_amount, 2),
-            "reason": "Liquidity sweep haut + Retest EMA + Volume + Bias baissier H1"
+            "reason": "Liquidity sweep + Retest EMA + Bias baissier H1"
         }
 
     return signal
