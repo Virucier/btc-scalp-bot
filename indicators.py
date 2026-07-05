@@ -49,5 +49,20 @@ def check_liquidity_sweep(df: pd.DataFrame, current_price: float, lookback: int 
     Returns: 'long_sweep', 'short_sweep', or 'none'
     """
     levels = get_recent_liquidity_levels(df, lookback)
-    
-    if levels["latest
+
+    recent_lows = df['low'].tail(3)
+    recent_highs = df['high'].tail(3)
+
+    if levels["latest_swing_low"] is not None:
+        swept_low = recent_lows.min() < levels["latest_swing_low"]
+        reclaimed = current_price > levels["latest_swing_low"]
+        if swept_low and reclaimed:
+            return "long_sweep"
+
+    if levels["latest_swing_high"] is not None:
+        swept_high = recent_highs.max() > levels["latest_swing_high"]
+        reclaimed = current_price < levels["latest_swing_high"]
+        if swept_high and reclaimed:
+            return "short_sweep"
+
+    return "none"

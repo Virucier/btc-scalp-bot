@@ -1,5 +1,5 @@
 import pandas as pd
-from bot.indicators import calculate_ema, detect_swing_highs_lows, check_liquidity_sweep
+from indicators import calculate_ema, detect_swing_highs_lows, check_liquidity_sweep
 
 def analyze_btc_signal(df_15m: pd.DataFrame, df_1h: pd.DataFrame, capital: float = 5.0) -> dict | None:
     """
