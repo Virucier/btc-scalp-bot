@@ -19,7 +19,7 @@ def detect_swing_highs_lows(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     )
     
     df['swing_low'] = (
-        (df['low'] == df['low'].rolling(window=window*2+1, center=True).max()) &
+        (df['low'] == df['low'].rolling(window=window*2+1, center=True).min()) &
         (df['low'] < df['low'].shift(window)) &
         (df['low'] < df['low'].shift(-window))
     )
@@ -50,19 +50,10 @@ def check_liquidity_sweep(df: pd.DataFrame, current_price: float, lookback: int 
     """
     levels = get_recent_liquidity_levels(df, lookback)
 
-    recent_lows = df['low'].tail(3)
-    recent_highs = df['high'].tail(3)
+    if levels["latest_swing_high"] and current_price > levels["latest_swing_high"]:
+        return "short_sweep"
 
-    if levels["latest_swing_low"] is not None:
-        swept_low = recent_lows.min() < levels["latest_swing_low"]
-        reclaimed = current_price > levels["latest_swing_low"]
-        if swept_low and reclaimed:
-            return "long_sweep"
-
-    if levels["latest_swing_high"] is not None:
-        swept_high = recent_highs.max() > levels["latest_swing_high"]
-        reclaimed = current_price < levels["latest_swing_high"]
-        if swept_high and reclaimed:
-            return "short_sweep"
+    if levels["latest_swing_low"] and current_price < levels["latest_swing_low"]:
+        return "long_sweep"
 
     return "none"
