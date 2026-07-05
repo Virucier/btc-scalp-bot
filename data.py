@@ -5,6 +5,9 @@ import time
 COLUMNS = ['open_time', 'open', 'high', 'low', 'close', 'volume']
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
+# Mémorise la dernière source qui a répondu avec succès, pour /debug
+LAST_SOURCE = {"name": None, "time": None}
+
 
 def _binance_klines(symbol, interval, limit):
     url = "https://api.binance.com/api/v3/klines"
@@ -103,6 +106,8 @@ def get_klines(symbol: str, interval: str, limit: int = 100):
                 df = fetch_fn(symbol, interval, limit)
                 if df is not None and len(df) > 0:
                     print(f"✅ Données récupérées via {name} ({len(df)} chandelles)")
+                    LAST_SOURCE["name"] = name
+                    LAST_SOURCE["time"] = pd.Timestamp.utcnow()
                     return df
             except Exception as e:
                 print(f"⚠️ {name} tentative {attempt + 1} échouée: {e}")
