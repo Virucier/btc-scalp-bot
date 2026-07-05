@@ -3,15 +3,17 @@ import pandas as pd
 import time
 
 def get_klines(symbol: str, interval: str, limit: int = 100):
-    """
-    Récupère les chandelles depuis Binance avec retry
-    """
     url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     
-    for attempt in range(3):
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json"
+    }
+
+    for attempt in range(4):  # 4 tentatives
         try:
-            response = requests.get(url, params=params, timeout=15)
+            response = requests.get(url, params=params, headers=headers, timeout=20)
             
             if response.status_code == 200:
                 data = response.json()
@@ -26,18 +28,16 @@ def get_klines(symbol: str, interval: str, limit: int = 100):
                 for col in ['open', 'high', 'low', 'close', 'volume']:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
                 
-                print(f"✅ Données Binance récupérées ({len(df)} chandelles)")
+                print(f"✅ Données récupérées ({len(df)} chandelles)")
                 return df
-                
-            elif response.status_code == 429:
-                print("⚠️ Rate limit Binance, attente 5s...")
-                time.sleep(5)
+
             else:
-                print(f"⚠️ Erreur Binance {response.status_code}")
+                print(f"⚠️ Erreur {response.status_code} - Tentative {attempt+1}")
                 
         except Exception as e:
-            print(f"❌ Tentative {attempt+1} échouée: {e}")
-            time.sleep(3)
-    
-    print("❌ Impossible de récupérer les données Binance après 3 tentatives")
+            print(f"❌ Erreur tentative {attempt+1}: {e}")
+        
+        time.sleep(4)  # attend 4 secondes entre chaque essai
+
+    print("❌ Échec après 4 tentatives")
     return None
