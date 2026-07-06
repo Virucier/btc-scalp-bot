@@ -7,6 +7,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from data import get_klines, LAST_SOURCE
 from strategy import analyze_btc_signal
+import storage
 
 load_dotenv()
 
@@ -60,7 +61,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/capital <montant> - mettre à jour ton capital\n"
         "/status - voir l'état du bot\n"
         "/debug - voir la source de données utilisée\n"
-        "/trades - voir les trades en cours de suivi"
+        "/trades - voir les trades en cours de suivi\n"
+        "/historique - voir les 10 derniers résultats + taux de réussite"
     )
 
 
@@ -140,6 +142,26 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    history = storage.get_history(limit=10)
+    stats = storage.get_win_rate()
+
+    if not history:
+        await update.message.reply_text("Pas encore d'historique de trades clôturés.")
+        return
+
+    lines = ["📜 <b>10 derniers trades clôturés</b>\n"]
+    for h in history:
+        icon = {"win": "✅", "loss": "❌", "expired": "⏳"}.get(h["outcome"], "•")
+        lines.append(f"{icon} {h['symbol']} {h['direction']} — entrée {h['entry']}")
+
+    if stats:
+        win_rate, wins, total = stats
+        lines.append(f"\n📊 Taux de réussite : {win_rate}% ({wins}/{total} trades avec résultat clair)")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 # ---------- Boucle automatique (remplace l'ancien while True) ----------
 
 async def check_open_trades(context: ContextTypes.DEFAULT_TYPE):
@@ -183,18 +205,21 @@ async def check_open_trades(context: ContextTypes.DEFAULT_TYPE):
                 text=f"✅ <b>Trade validé</b> — {symbol} {trade['direction']}\nTP1 atteint ({trade['tp1']} USDT)",
                 parse_mode="HTML",
             )
+            storage.close_trade(trade, "win")
         elif outcome == "loss":
             await context.bot.send_message(
                 chat_id=CHAT_ID,
                 text=f"❌ <b>Trade perdu</b> — {symbol} {trade['direction']}\nSL touché ({trade['sl']} USDT)",
                 parse_mode="HTML",
             )
+            storage.close_trade(trade, "loss")
         elif elapsed_minutes >= MAX_TRADE_DURATION_MINUTES:
             await context.bot.send_message(
                 chat_id=CHAT_ID,
                 text=f"⏳ <b>Trade expiré</b> — {symbol} {trade['direction']}\nNi TP1 ni SL touché après {MAX_TRADE_DURATION_MINUTES} min.",
                 parse_mode="HTML",
             )
+            storage.close_trade(trade, "expired")
         else:
             still_open.append(trade)  # toujours en cours, on garde
 
@@ -205,6 +230,7 @@ async def check_signal_job(context: ContextTypes.DEFAULT_TYPE):
     if today != state["current_day"]:
         state["current_day"] = today
         state["signals_sent_today"] = 0
+        storage.save_daily_counter(state["current_day"], 0)
 
     if not CHAT_ID:
         return
@@ -238,7 +264,10 @@ async def check_signal_job(context: ContextTypes.DEFAULT_TYPE):
 
             state["last_signal_time"][symbol] = current_time
             state["signals_sent_today"] += 1
-            state["open_trades"].append({
+            storage.save_cooldown(symbol, current_time)
+            storage.save_daily_counter(state["current_day"], state["signals_sent_today"])
+
+            new_trade = {
                 "symbol": symbol,
                 "direction": signal["direction"],
                 "entry": signal["entry"],
@@ -246,7 +275,9 @@ async def check_signal_job(context: ContextTypes.DEFAULT_TYPE):
                 "tp1": signal["tp1"],
                 "tp2": signal["tp2"],
                 "opened_at": current_time,
-            })
+            }
+            new_trade["db_id"] = storage.add_open_trade(new_trade)
+            state["open_trades"].append(new_trade)
             print(f"[{current_time.strftime('%H:%M')}] Signal {signal['direction']} envoyé pour {symbol}.")
 
         except Exception as e:
@@ -260,6 +291,21 @@ def main():
     if not CHAT_ID:
         print("⚠️ CHAT_ID manquant : les commandes marcheront, mais pas les signaux automatiques.")
 
+    storage.init_db()
+    state["open_trades"] = storage.load_open_trades()
+    if state["open_trades"]:
+        print(f"🔄 {len(state['open_trades'])} trade(s) en cours rechargé(s) depuis la sauvegarde.")
+
+    saved_cooldowns = storage.load_cooldowns()
+    state["last_signal_time"].update(saved_cooldowns)
+
+    saved_counter = storage.load_daily_counter()
+    if saved_counter is not None:
+        saved_day, saved_count = saved_counter
+        if saved_day == str(state["current_day"]):
+            state["signals_sent_today"] = saved_count
+    print(f"🔄 État rechargé : cooldowns={len(saved_cooldowns)}, signaux aujourd'hui={state['signals_sent_today']}")
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -268,6 +314,7 @@ def main():
     app.add_handler(CommandHandler("signal", force_signal))
     app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(CommandHandler("trades", open_trades_cmd))
+    app.add_handler(CommandHandler("historique", history_cmd))
 
     app.job_queue.run_repeating(check_signal_job, interval=CHECK_INTERVAL_MINUTES * 60, first=15)
 

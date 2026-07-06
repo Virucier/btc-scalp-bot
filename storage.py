@@ -118,3 +118,64 @@ def get_win_rate():
     if total == 0:
         return None
     return round((wins / total) * 100, 1), wins, total
+
+
+# ---------- Cooldown + compteur journalier (survit aux redémarrages) ----------
+
+def _init_bot_state_tables(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cooldowns (
+            symbol TEXT PRIMARY KEY,
+            last_signal_time TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS daily_counter (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            current_day TEXT NOT NULL,
+            signals_sent_today INTEGER NOT NULL
+        )
+    """)
+
+
+def save_cooldown(symbol: str, timestamp: datetime):
+    path = _get_path()
+    with closing(sqlite3.connect(path)) as conn:
+        _init_bot_state_tables(conn)
+        conn.execute(
+            "INSERT INTO cooldowns (symbol, last_signal_time) VALUES (?, ?) "
+            "ON CONFLICT(symbol) DO UPDATE SET last_signal_time = excluded.last_signal_time",
+            (symbol, timestamp.isoformat()),
+        )
+        conn.commit()
+
+
+def load_cooldowns():
+    path = _get_path()
+    with closing(sqlite3.connect(path)) as conn:
+        _init_bot_state_tables(conn)
+        rows = conn.execute("SELECT symbol, last_signal_time FROM cooldowns").fetchall()
+    return {symbol: datetime.fromisoformat(ts) for symbol, ts in rows}
+
+
+def save_daily_counter(current_day, count: int):
+    path = _get_path()
+    with closing(sqlite3.connect(path)) as conn:
+        _init_bot_state_tables(conn)
+        conn.execute(
+            "INSERT INTO daily_counter (id, current_day, signals_sent_today) VALUES (1, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET current_day = excluded.current_day, "
+            "signals_sent_today = excluded.signals_sent_today",
+            (str(current_day), count),
+        )
+        conn.commit()
+
+
+def load_daily_counter():
+    path = _get_path()
+    with closing(sqlite3.connect(path)) as conn:
+        _init_bot_state_tables(conn)
+        row = conn.execute("SELECT current_day, signals_sent_today FROM daily_counter WHERE id = 1").fetchone()
+    if row is None:
+        return None
+    return row[0], row[1]
