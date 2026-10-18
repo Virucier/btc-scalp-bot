@@ -76,7 +76,7 @@ def timeframe_trend(row) -> tuple[str, int]:
 
 
 def analyze(symbol: str = "BTC/USDT", exchange_id: str = "binance") -> dict:
-    exchange = get_exchange(exchange_id, symbol)
+    exchange = connect(exchange_id, symbol)
     result = {"symbol": symbol, "exchange": exchange.id, "timeframes": {}}
     total = 0
     frames = {}
@@ -131,17 +131,29 @@ def analyze(symbol: str = "BTC/USDT", exchange_id: str = "binance") -> dict:
     return result
 
 
-def get_exchange(exchange_id: str, symbol: str):
+def get_exchange(exchange_id: str):
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    })
+
+    ca_bundle = os.getenv("REQUESTS_CA_BUNDLE") or os.getenv("CURL_CA_BUNDLE")
+    if ca_bundle:
+        session.verify = ca_bundle
+
+    exchange_class = getattr(ccxt, exchange_id)
+    return exchange_class({
+        "enableRateLimit": True,
+        "session": session,
+    })
+
+
+def connect(exchange_id: str, symbol: str):
     """Tente l'exchange demandé puis les alternatives si indisponible (ex: restriction géographique)."""
     last_err = None
     for eid in [exchange_id] + [e for e in FALLBACK_EXCHANGES if e != exchange_id]:
         try:
-            ex = getattr(ccxt, eid)({"enableRateLimit": True})
-            # CA personnalisée (proxy d'entreprise/sandbox) : ccxt ignore REQUESTS_CA_BUNDLE
-            ca = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
-            if ca:
-                ex.session = requests.Session()
-                ex.session.verify = ca
+            ex = get_exchange(eid)
             ex.fetch_ohlcv(symbol, "1h", limit=2)
             return ex
         except Exception as e:  # noqa: BLE001
