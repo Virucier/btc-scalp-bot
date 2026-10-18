@@ -23,7 +23,10 @@ REST_TIMEOUT = 5
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 WS_EXCHANGES = ("gate", "kucoin")
 REST_EXCHANGES = ("gate", "kucoin", "okx")
-MAX_WS_FAILURES = 3          # échecs consécutifs avant repli sur REST
+MAX_WS_FAILURES = 5          # échecs consécutifs avant repli sur REST
+RECONNECT_BASE = 0.1         # reconnexion ultra-courte : 0,1 → 0,2 → 0,4 → 0,8 s (plafonné) + jitter
+RECONNECT_CAP = 0.8
+WS_RETRY_DURING_FALLBACK = 5.0   # pendant un repli REST, on retente le WebSocket toutes les N secondes
 
 
 @dataclass
@@ -47,6 +50,7 @@ class FeedStats:
     _last: float = 0.0
     first_tick_ts: float = 0.0
     ws_ready_ms: float = 0.0           # connexion + ack d'abonnement
+    reconnect_ms: list = field(default_factory=list)   # perte -> premier message de la nouvelle connexion
 
     def record(self, t: Tick) -> None:
         self.ticks += 1
@@ -201,14 +205,30 @@ def _ws_gate(symbol: str, stats: Optional["FeedStats"] = None) -> Iterator[Optio
         ws.close()
 
 
+_KU_CACHE: dict = {}
+
+
+def _kucoin_info(max_age: float = 600.0) -> dict:
+    """Jeton public KuCoin, réutilisé pour les reconnexions (évite ~200 ms d'aller-retour REST à T=0)."""
+    if _KU_CACHE and time.time() - _KU_CACHE["t"] < max_age:
+        return _KU_CACHE["info"]
+    info = HTTP.post("https://api.kucoin.com/api/v1/bullet-public", timeout=REST_TIMEOUT).json()["data"]
+    _KU_CACHE.update(info=info, t=time.time())
+    return info
+
+
 def _ws_kucoin(symbol: str, stats: Optional["FeedStats"] = None) -> Iterator[Optional[Tick]]:
     """KuCoin : /market/ticker (meilleur bid/ask) + /market/match (trades)."""
     pair = pair_id("kucoin", symbol)
     t_conn = time.time()
-    info = HTTP.post("https://api.kucoin.com/api/v1/bullet-public", timeout=REST_TIMEOUT).json()["data"]
+    info = _kucoin_info()
     srv = info["instanceServers"][0]
     ping_every = srv["pingInterval"] / 1000 * 0.8
-    ws = websocket.create_connection(f"{srv['endpoint']}?token={info['token']}", timeout=10, sslopt=_sslopt())
+    try:
+        ws = websocket.create_connection(f"{srv['endpoint']}?token={info['token']}", timeout=10, sslopt=_sslopt())
+    except Exception:
+        _KU_CACHE.clear()               # jeton peut-être périmé : on le redemande à la prochaine tentative
+        raise
 
     def sub():
         for topic in (f"/market/ticker:{pair}", f"/market/match:{pair}"):
@@ -254,23 +274,28 @@ _WS = {"gate": _ws_gate, "kucoin": _ws_kucoin}
 
 
 def stream_ws(exchange: str, symbol: str, stats: FeedStats) -> Iterator[Optional[Tick]]:
-    """WebSocket avec reconnexion (backoff 1→8 s) ; lève RuntimeError après MAX_WS_FAILURES échecs d'affilée."""
-    failures, delay = 0, 1.0
+    """WebSocket avec reconnexion ultra-rapide (0,1 → 0,2 → 0,4 → 0,8 s, jitter ±20 %).
+    Lève RuntimeError après MAX_WS_FAILURES échecs consécutifs. Un échec est « soldé » dès que la nouvelle
+    connexion livre son premier message (tick ou battement : connexion + abonnement établis)."""
+    failures, delay, lost_at = 0, RECONNECT_BASE, None
     while True:
         try:
             for tick in _WS[exchange](symbol, stats):
-                if tick is not None:
-                    failures, delay = 0, 1.0
+                if lost_at is not None:
+                    stats.reconnect_ms.append((time.time() - lost_at) * 1000)
+                    lost_at = None
+                failures, delay = 0, RECONNECT_BASE
                 yield tick
         except (websocket.WebSocketException, OSError, RuntimeError, ValueError, KeyError,
                 requests.RequestException) as e:
+            lost_at = lost_at or time.time()
             failures += 1
             stats.reconnects += 1
             print(f"[feed] WS {exchange} coupé ({type(e).__name__}: {str(e)[:80]}) — essai {failures}/{MAX_WS_FAILURES}")
             if failures >= MAX_WS_FAILURES:
                 raise RuntimeError("WebSocket indisponible") from e
-            time.sleep(delay)
-            delay = min(delay * 2, 8)
+            time.sleep(delay * random.uniform(0.8, 1.2))
+            delay = min(delay * 2, RECONNECT_CAP)
 
 
 # ---------------------------------------------------------------- Mock
@@ -312,14 +337,22 @@ def stream_prices(exchange: str, symbol: str, mode: str = "auto", interval: floa
 
 
 def _with_fallback(exchange, symbol, interval, stats, allow_fallback):
-    try:
-        yield from stream_ws(exchange, symbol, stats)
-    except RuntimeError:
-        if not allow_fallback:
-            raise
+    """WebSocket ; après MAX_WS_FAILURES échecs, repli REST temporaire, puis nouvelle tentative WebSocket."""
+    while True:
+        try:
+            yield from stream_ws(exchange, symbol, stats)
+        except RuntimeError:
+            if not allow_fallback:
+                raise
         stats.mode = f"rest({interval}s) [repli après échec WS]"
-        print(f"[feed] repli sur REST polling ({interval}s)")
-        yield from stream_rest(exchange, symbol, interval)
+        print(f"[feed] repli sur REST polling ({interval}s) ; nouvelle tentative WebSocket dans {WS_RETRY_DURING_FALLBACK:g}s")
+        t_end = time.time() + WS_RETRY_DURING_FALLBACK
+        for tick in stream_rest(exchange, symbol, interval):
+            yield tick
+            if time.time() >= t_end:
+                break
+        stats.mode = "websocket"
+        print("[feed] nouvelle tentative WebSocket")
 
 
 # ---------------------------------------------------------------- Enregistrement / rejeu

@@ -12,6 +12,8 @@ Usage:
     python listing_sniper.py monitor replay <ticks.json> [--speed 10]    # backtest sur un enregistrement
     python listing_sniper.py hunter [--lead 300] [--post 30] [--record-dir ticks] [--notify]   # chasse automatique
     python listing_sniper.py monitor ... --contract 0x… --chain 1      # audit GoPlus/DexScreener obligatoire avant l'entrée
+    python listing_sniper.py preflight [--record-dir ticks]          # à lancer sur le serveur avant le hunter
+    python listing_sniper.py analyze_ticks <ticks.json> [--json]     # spread, hausse 1re seconde, volume 1re minute
     python listing_sniper.py audit <chain_id> <adresse_contrat>
     python listing_sniper.py simulate
 
@@ -633,6 +635,68 @@ def cmd_hunter(args) -> None:
         print("\nArrêt du hunter ; les monitors en cours continuent jusqu'à leur durée max." if procs else "\nArrêt.")
 
 
+def cmd_preflight(args) -> None:
+    """Vérifie l'environnement du serveur avant le déploiement du hunter (réseau, WebSockets, horloge, disque)."""
+    import json as _json
+    import tempfile
+
+    import websocket
+
+    from price_feed import FeedStats, _kucoin_info, _sslopt, _ws_gate, _ws_kucoin
+    results = []
+
+    def check(name, fn, critical=True):
+        t = time.time()
+        try:
+            detail = fn()
+            results.append((name, True, f"{(time.time() - t) * 1000:.0f} ms" + (f" — {detail}" if detail else ""), critical))
+        except Exception as e:  # noqa: BLE001
+            results.append((name, False, f"{type(e).__name__}: {str(e)[:90]}", critical))
+
+    def ws_ack(gen_fn):
+        st, it = FeedStats(), None
+        it = gen_fn("BTC", st)
+        deadline = time.time() + 10
+        for item in it:                        # 1er élément = connexion + abonnement établis (tick ou battement)
+            return f"WS prêt en {st.ws_ready_ms:.0f} ms"
+            if time.time() > deadline:
+                raise TimeoutError
+
+    def skew():
+        t0 = time.time()
+        srv = _get_json("https://api.gateio.ws/api/v4/spot/time")["server_time"] / 1000
+        t1 = time.time()
+        d = (t0 + t1) / 2 - srv
+        if abs(d) > 1.0:
+            raise RuntimeError(f"horloge locale décalée de {d:+.2f}s (installez/activez NTP)")
+        return f"décalage horloge {d * 1000:+.0f} ms"
+
+    def disk():
+        Path(args.record_dir).mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=args.record_dir):
+            pass
+        return f"{args.record_dir}/ inscriptible"
+
+    check("KuCoin annonces (REST)", lambda: f"{len(fetch_kucoin_listings())} annonces analysées")
+    check("Gate.io paires (REST)", lambda: f"{len(fetch_gate_listings())} listing(s) futur(s)")
+    check("Gate.io WebSocket", lambda: ws_ack(_ws_gate))
+    check("KuCoin WebSocket", lambda: ws_ack(_ws_kucoin))
+    check("GoPlus (audit)", lambda: _get_json("https://api.gopluslabs.io/api/v1/token_security/1",
+                                              contract_addresses="0xdac17f958d2ee523a2206206994597c13d831ec7") and "")
+    check("DexScreener (audit)", lambda: _get_json("https://api.dexscreener.com/latest/dex/tokens/0xdac17f958d2ee523a2206206994597c13d831ec7") and "")
+    check("Horloge vs Gate.io", skew)
+    check("Disque d'enregistrement", disk)
+    from telegram_notifier import telegram_configured
+    results.append(("Telegram (variables d'env.)", telegram_configured(),
+                    "TELEGRAM_TOKEN + TELEGRAM_CHAT_ID présents" if telegram_configured() else "absentes → pas d'alertes", False))
+    print("=== Préflight hunter ===")
+    for name, ok, detail, crit in results:
+        print(f"  {'✅' if ok else ('⛔' if crit else '⚠️ ')} {name:<28} {detail}")
+    if not all(ok for _, ok, _, crit in results if crit):
+        sys.exit("Préflight ÉCHOUÉ : corrigez les points ⛔ avant de lancer le hunter.")
+    print("Préflight OK (les points ⚠️ sont facultatifs).")
+
+
 def cmd_audit(args) -> None:
     print_audit(audit_gate(args.address, args.chain_id, not args.allow_unlocked_lp))
 
@@ -700,10 +764,18 @@ def main() -> None:
                    help="avec --record : continue d'enregistrer SEC secondes après la clôture de la position")
     m.add_argument("--speed", type=float, default=1.0, help="vitesse de rejeu (exchange=replay ; 0 = instantané)")
     sub.add_parser("simulate")
+    pf = sub.add_parser("preflight", help="vérifie réseau, WebSockets, horloge et disque avant déploiement")
+    pf.add_argument("--record-dir", default="ticks")
+    t = sub.add_parser("analyze_ticks", aliases=["analyze-ticks"], help="statistiques de liquidité d'un enregistrement (sans machine à états)")
+    t.add_argument("file")
+    t.add_argument("--json", action="store_true")
     args = p.parse_args()
+    if args.cmd == "analyze-ticks":
+        args.cmd = "analyze_ticks"
     if args.cmd == "hunter":
         args.t0 = datetime.now(timezone.utc)
-    handlers = {"audit": cmd_audit, "simulate": cmd_simulate, "monitor": cmd_monitor, "watch": cmd_watch, "hunter": cmd_hunter}
+    handlers = {"audit": cmd_audit, "simulate": cmd_simulate, "monitor": cmd_monitor, "watch": cmd_watch, "hunter": cmd_hunter, "preflight": cmd_preflight,
+                "analyze_ticks": lambda a: __import__("tick_analysis").run(a.file, a.json)}
     if args.cmd in handlers:
         handlers[args.cmd](args)
     else:
