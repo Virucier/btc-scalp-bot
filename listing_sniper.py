@@ -5,7 +5,9 @@ Module 2 - audit anti-scam d'un contrat (GoPlus Security + DexScreener)
 Module 3 - plan de trade listing (TP1 +100 %, TP2 +300 %, trailing stop serré)
 
 Usage:
-    python listing_sniper.py scan [--days 1] [--recent 7]
+    python listing_sniper.py scan [--days 1] [--recent 7] [--notify] [--dry-run]
+    python listing_sniper.py watch [--interval 300] [--days 1] [--dry-run]
+    python listing_sniper.py monitor <gate|kucoin|okx|mock> <SYMBOLE> [--mode auto|ws|rest] [--size 100]
     python listing_sniper.py audit <chain_id> <adresse_contrat>
     python listing_sniper.py simulate
 
@@ -14,6 +16,7 @@ volatils et le risque de perte totale est réel.
 """
 import argparse
 import os
+import sys
 import re
 import time
 from dataclasses import dataclass, field
@@ -331,6 +334,90 @@ def cmd_scan(args) -> None:
                 delta = f"  dans {h}h{m:02d}"
             print(f"  [{l.exchange:<7}] {l.market:<7} {l.symbol:<10} {when} UTC{delta}")
         print()
+    if args.notify:
+        from telegram_notifier import notify_new_listings, telegram_configured
+        if not args.dry_run and not telegram_configured():
+            sys.exit("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID manquants (ou utilisez --dry-run).")
+        upcoming = [l for l in listings if l.start >= now - timedelta(days=0, hours=1)]
+        sent = notify_new_listings(upcoming, dry_run=args.dry_run)
+        print(f"{len(sent)} alerte(s) Telegram {'simulée(s)' if args.dry_run else 'envoyée(s)'}.")
+
+
+def cmd_watch(args) -> None:
+    """Rescan périodique ; alerte Telegram à chaque nouveau listing (dédoublonné)."""
+    from telegram_notifier import notify_new_listings, telegram_configured
+    if not args.dry_run and not telegram_configured():
+        sys.exit("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID manquants (ou utilisez --dry-run).")
+    print(f"Surveillance des listings toutes les {args.interval}s (Ctrl+C pour arrêter)")
+    while True:
+        sent = notify_new_listings(scan_listings(args.days, 0), dry_run=args.dry_run)
+        print(f"[{datetime.now(timezone.utc):%H:%M:%S}] {len(sent)} nouvelle(s) alerte(s)")
+        time.sleep(args.interval)
+
+
+def _pnl(pos: "ListingPosition", realized: float, price: float) -> float:
+    """PnL en % de la mise : ventes déjà faites (multiples) + reste valorisé au prix courant."""
+    return (realized + pos.remaining * price / pos.entry - 1) * 100
+
+
+def cmd_monitor(args) -> None:
+    """Flux de prix temps réel -> ListingPosition ; exécution SIMULÉE affichée en direct."""
+    from price_feed import FeedStats, stream_prices, wait_until_listed
+    from telegram_notifier import notify_text
+
+    ex, sym = args.exchange.lower(), args.symbol.upper()
+    out = (lambda m: notify_text(m, dry_run=args.dry_run)) if args.notify else (lambda m: None)
+    ts = lambda: f"{datetime.now(timezone.utc):%H:%M:%S.%f}"[:-3]
+
+    if ex != "mock":
+        print(f"[{ts()}] Attente de la cotation {sym} sur {ex} (sonde REST {args.poll}s)…")
+        if wait_until_listed(ex, sym, args.poll, args.wait_timeout) is None:
+            sys.exit("Timeout : le jeton n'est toujours pas coté.")
+
+    stats, pos, realized, last_status, t_start = FeedStats(), None, 0.0, 0.0, time.time()
+    cfg = ListingPlanConfig()
+    try:
+        for tick in stream_prices(ex, sym, args.mode, args.interval, stats):
+            if pos is None:
+                pos = ListingPosition(tick.price, args.size, cfg)
+                print(f"[{ts()}] 🟢 ENTRÉE simulée {sym} @ {tick.price:.8g} (mise {args.size:g}$, feed {stats.mode})")
+                print("          " + describe_plan(tick.price, cfg))
+                out(f"<b>🟢 ENTRÉE simulée {sym}</b> ({ex}) @ {tick.price:.8g}\n{describe_plan(tick.price, cfg)}")
+                continue
+            for a in pos.on_price(tick.price):
+                realized += a.fraction * a.price / pos.entry
+                icon = {"TP1": "🎯", "TP2": "🚀", "STOP": "🛑", "TRAILING_STOP": "🔒"}[a.kind]
+                line = (f"{icon} {a.kind} @ {a.price:.8g} ({a.price / pos.entry:.2f}x) — vend {a.fraction:.0%} "
+                        f"— {a.note} — reste {pos.remaining:.0%}")
+                print(f"[{ts()}] {line}")
+                out(f"<b>{sym}</b> {line}")
+            if pos.closed:
+                break
+            if time.time() - last_status >= args.status_every:
+                last_status = time.time()
+                print(f"[{ts()}] · {tick.price:.8g} ({tick.price / pos.entry:.2f}x) pic {pos.peak / pos.entry:.2f}x "
+                      f"stop {pos.stop / pos.entry:.2f}x reste {pos.remaining:.0%} PnL {_pnl(pos, realized, tick.price):+.1f}%")
+            if args.duration and time.time() - t_start > args.duration:
+                print(f"[{ts()}] Durée max atteinte ({args.duration}s)")
+                break
+    except KeyboardInterrupt:
+        print("\nArrêt manuel.")
+    except RuntimeError as e:
+        print(f"[feed] {e}")
+
+    print("\n=== Résumé de la simulation ===")
+    if pos:
+        final = (realized - 1) * 100 if pos.closed else _pnl(pos, realized, tick.price)
+        print(f"Entrée {pos.entry:.8g} | plus haut {pos.peak / pos.entry:.2f}x | "
+              f"TP1 {'oui' if pos.tp1_hit else 'non'} | TP2 {'oui' if pos.tp2_hit else 'non'} | "
+              f"{'clôturée' if pos.closed else f'ouverte ({pos.remaining:.0%})'} | "
+              f"PnL simulé {final:+.1f}% ({args.size * final / 100:+.2f}$ sur {args.size:g}$)")
+        out(f"<b>Résumé {sym}</b> : PnL simulé {final:+.1f}% (plus haut {pos.peak / pos.entry:.2f}x)")
+    else:
+        print("Aucun tick reçu.")
+    lat = f"{sum(stats.lat_ms) / len(stats.lat_ms):.0f} ms moy." if stats.lat_ms else "n/a"
+    print(f"Feed: {stats.mode} | {stats.ticks} ticks | reconnexions {stats.reconnects} | "
+          f"plus grand silence {stats.max_gap:.2f}s | latence reçue-vs-exchange {lat}")
 
 
 def cmd_audit(args) -> None:
@@ -362,13 +449,34 @@ def main() -> None:
     s = sub.add_parser("scan")
     s.add_argument("--days", type=int, default=1, help="jours à venir (défaut 1 = aujourd'hui)")
     s.add_argument("--recent", type=int, default=0, help="inclure les listings des N derniers jours")
+    s.add_argument("--notify", action="store_true", help="alerte Telegram pour les listings non encore notifiés")
+    s.add_argument("--dry-run", action="store_true", help="affiche les messages au lieu de les envoyer")
+    w = sub.add_parser("watch")
+    w.add_argument("--interval", type=int, default=300)
+    w.add_argument("--days", type=int, default=1)
+    w.add_argument("--dry-run", action="store_true")
     a = sub.add_parser("audit")
     a.add_argument("chain_id")
     a.add_argument("address")
+    m = sub.add_parser("monitor", help="flux de prix temps réel + exécution simulée du plan")
+    m.add_argument("exchange", help="gate | kucoin | okx | mock (flux simulé)")
+    m.add_argument("symbol")
+    m.add_argument("--mode", choices=["auto", "ws", "rest"], default="auto")
+    m.add_argument("--interval", type=float, default=0.5, help="période REST (s) / vitesse du mock")
+    m.add_argument("--poll", type=float, default=0.5, help="période de sonde avant la cotation (s)")
+    m.add_argument("--wait-timeout", type=float, default=None, help="abandonner l'attente de cotation après N s")
+    m.add_argument("--size", type=float, default=100.0, help="mise simulée en $")
+    m.add_argument("--duration", type=float, default=0, help="durée max en s (0 = illimité)")
+    m.add_argument("--status-every", type=float, default=5.0)
+    m.add_argument("--notify", action="store_true", help="envoie aussi les événements sur Telegram")
+    m.add_argument("--dry-run", action="store_true")
     sub.add_parser("simulate")
     args = p.parse_args()
-    {"audit": cmd_audit, "simulate": cmd_simulate}.get(args.cmd, cmd_scan)(
-        args if args.cmd else argparse.Namespace(days=1, recent=0))
+    handlers = {"audit": cmd_audit, "simulate": cmd_simulate, "monitor": cmd_monitor, "watch": cmd_watch}
+    if args.cmd in handlers:
+        handlers[args.cmd](args)
+    else:
+        cmd_scan(args if args.cmd else argparse.Namespace(days=1, recent=0, notify=False, dry_run=False))
 
 
 if __name__ == "__main__":

@@ -60,7 +60,7 @@ def send_telegram_alert(text_message: str, bot_token: str | None = None, chat_id
     bot_token = bot_token or os.environ["TELEGRAM_TOKEN"]
     chat_id = chat_id or os.environ["TELEGRAM_CHAT_ID"]
     response = requests.post(
-        f"https://api.telegram.org/bot{bot_token}/sendMessage",
+        f"{os.getenv('TELEGRAM_API_BASE', 'https://api.telegram.org')}/bot{bot_token}/sendMessage",
         json={
             "chat_id": chat_id,
             "text": text_message,

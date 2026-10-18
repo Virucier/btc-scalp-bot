@@ -15,3 +15,5 @@ env/
 
 # Logs
 *.log
+.listing_seen.json
+
