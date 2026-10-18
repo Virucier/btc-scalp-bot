@@ -8,6 +8,8 @@ Usage:
     python listing_sniper.py scan [--days 1] [--recent 7] [--notify] [--dry-run]
     python listing_sniper.py watch [--interval 300] [--days 1] [--dry-run]
     python listing_sniper.py monitor <gate|kucoin|okx|mock> <SYMBOLE> [--mode auto|ws|rest] [--size 100]
+                                     [--slippage 5] [--record ticks.json] [--wait-timeout N]
+    python listing_sniper.py monitor replay <ticks.json> [--speed 10]    # backtest sur un enregistrement
     python listing_sniper.py audit <chain_id> <adresse_contrat>
     python listing_sniper.py simulate
 
@@ -16,11 +18,12 @@ volatils et le risque de perte totale est réel.
 """
 import argparse
 import os
-import sys
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import requests
 
@@ -251,20 +254,31 @@ class ListingPlanConfig:
 @dataclass
 class Action:
     kind: str          # TP1 | TP2 | STOP | TRAILING_STOP
-    price: float
+    price: float       # prix d'exécution simulé (tick - slippage)
     fraction: float    # part de la position INITIALE à vendre
     note: str = ""
+    tick_price: float = 0.0   # prix du tick qui a déclenché l'ordre
 
 
 class ListingPosition:
     """Machine à états : nourrir `on_price()` avec chaque prix, elle renvoie les ordres de sortie."""
 
-    def __init__(self, entry: float, size_usd: float, cfg: ListingPlanConfig = ListingPlanConfig()):
-        self.cfg, self.entry, self.size_usd = cfg, entry, size_usd
+    def __init__(self, entry: float, size_usd: float, cfg: ListingPlanConfig = ListingPlanConfig(),
+                 slippage_penalty_pct: float = 5.0):
+        """`entry` = prix du tick d'entrée. Achat simulé à tick*(1+pénalité), ventes à tick*(1-pénalité).
+        Tous les seuils (SL, TP, trailing) sont calculés sur le prix d'exécution réel de l'achat."""
+        self.cfg, self.size_usd = cfg, size_usd
+        self.slippage = slippage_penalty_pct / 100
+        self.tick_entry = entry
+        self.entry = entry * (1 + self.slippage)     # prix d'achat réellement obtenu
         self.remaining = 1.0            # fraction de la position initiale encore ouverte
-        self.peak = entry
+        self.peak = self.entry
         self.tp1_hit = self.tp2_hit = False
-        self.stop = entry * (1 - cfg.initial_sl)
+        self.stop = self.entry * (1 - cfg.initial_sl)
+
+    def exit_price(self, tick_price: float) -> float:
+        """Prix de vente simulé pour un tick donné."""
+        return tick_price * (1 - self.slippage)
 
     @property
     def closed(self) -> bool:
@@ -279,7 +293,7 @@ class ListingPosition:
         acts = []
         if price <= self.stop:      # le stop prime sur les TP si le prix gappe
             kind = "STOP" if self.stop <= self.entry * (1 - self.cfg.initial_sl) + 1e-12 else "TRAILING_STOP"
-            acts.append(Action(kind, price, self.remaining, f"stop à {self.stop:.6g}"))
+            acts.append(Action(kind, self.exit_price(price), self.remaining, f"stop à {self.stop:.6g}", price))
             self.remaining = 0.0
             return acts
 
@@ -292,13 +306,13 @@ class ListingPosition:
             self.tp1_hit = True
             self.remaining -= self.cfg.tp1_fraction
             self.stop = max(self.stop, self.entry, self.peak * (1 - self._trail()))  # capital sécurisé
-            acts.append(Action("TP1", price, self.cfg.tp1_fraction, "capital récupéré, stop >= entrée"))
+            acts.append(Action("TP1", self.exit_price(price), self.cfg.tp1_fraction, "capital récupéré, stop >= entrée", price))
         if self.tp1_hit and not self.tp2_hit and price >= self.entry * (1 + self.cfg.tp2):
             self.tp2_hit = True
             frac = min(self.cfg.tp2_fraction, self.remaining)
             self.remaining -= frac
             self.stop = max(self.stop, self.peak * (1 - self._trail()))
-            acts.append(Action("TP2", price, frac, "trailing resserré sur le runner"))
+            acts.append(Action("TP2", self.exit_price(price), frac, "trailing resserré sur le runner", price))
         return acts
 
 
@@ -355,69 +369,111 @@ def cmd_watch(args) -> None:
         time.sleep(args.interval)
 
 
-def _pnl(pos: "ListingPosition", realized: float, price: float) -> float:
-    """PnL en % de la mise : ventes déjà faites (multiples) + reste valorisé au prix courant."""
-    return (realized + pos.remaining * price / pos.entry - 1) * 100
+def _pnl(pos: "ListingPosition", realized: float, tick_price: float) -> float:
+    """PnL en % de la mise : ventes déjà faites + reste valorisé au prix de sortie simulé (slippage inclus)."""
+    return (realized + pos.remaining * pos.exit_price(tick_price) / pos.entry - 1) * 100
 
 
 def cmd_monitor(args) -> None:
-    """Flux de prix temps réel -> ListingPosition ; exécution SIMULÉE affichée en direct."""
-    from price_feed import FeedStats, stream_prices, wait_until_listed
+    """Flux de prix temps réel -> ListingPosition ; exécution SIMULÉE (avec slippage) affichée en direct.
+
+    Gate.io / KuCoin en mode auto|ws : « WS-first » — on s'abonne au WebSocket AVANT la cotation et le
+    premier tick reçu déclenche l'entrée (aucun polling REST). OKX / mode rest : sonde REST puis flux.
+    """
+    from price_feed import FeedStats, TickRecorder, WS_EXCHANGES, stream_prices, stream_replay, wait_until_listed
     from telegram_notifier import notify_text
 
     ex, sym = args.exchange.lower(), args.symbol.upper()
+    replay = ex == "replay"
     out = (lambda m: notify_text(m, dry_run=args.dry_run)) if args.notify else (lambda m: None)
     ts = lambda: f"{datetime.now(timezone.utc):%H:%M:%S.%f}"[:-3]
+    ws_first = ex in WS_EXCHANGES and args.mode in ("auto", "ws")
 
-    if ex != "mock":
+    recorder = TickRecorder(args.record, {"exchange": ex, "symbol": sym, "started": time.time()}) if args.record else None
+    stats = FeedStats()
+    if replay:
+        def _counted(src):
+            for t in src:
+                stats.record(t)
+                yield t
+        feed = _counted(stream_replay(args.symbol, args.speed))   # `symbol` = chemin du fichier
+        stats.mode = f"replay x{args.speed:g}"
+        sym = Path(args.symbol).stem.upper()
+    elif ex == "mock":
+        feed = stream_prices(ex, sym, args.mode, args.interval, stats)
+    elif ws_first:
+        print(f"[{ts()}] WS-first : abonnement {ex} {sym}/USDT AVANT la cotation, 1er tick => entrée (pas de polling REST)")
+        feed = stream_prices(ex, sym, args.mode, args.interval, stats)
+    else:
         print(f"[{ts()}] Attente de la cotation {sym} sur {ex} (sonde REST {args.poll}s)…")
         if wait_until_listed(ex, sym, args.poll, args.wait_timeout) is None:
             sys.exit("Timeout : le jeton n'est toujours pas coté.")
+        feed = stream_prices(ex, sym, args.mode, args.interval, stats)
 
-    stats, pos, realized, last_status, t_start = FeedStats(), None, 0.0, 0.0, time.time()
+    pos, realized, last_status, t_start, tick = None, 0.0, 0.0, time.time(), None
     cfg = ListingPlanConfig()
     try:
-        for tick in stream_prices(ex, sym, args.mode, args.interval, stats):
+        for tick in feed:
+            elapsed = time.time() - t_start
+            if tick is None:                       # battement : pas de tick depuis ~1 s
+                if pos is None and args.wait_timeout and elapsed > args.wait_timeout:
+                    print(f"[{ts()}] Timeout : aucun tick reçu en {args.wait_timeout:g}s")
+                    break
+                if args.duration and elapsed > args.duration:
+                    print(f"[{ts()}] Durée max atteinte ({args.duration:g}s)")
+                    break
+                continue
+            if recorder:
+                recorder.write(tick)
             if pos is None:
-                pos = ListingPosition(tick.price, args.size, cfg)
-                print(f"[{ts()}] 🟢 ENTRÉE simulée {sym} @ {tick.price:.8g} (mise {args.size:g}$, feed {stats.mode})")
-                print("          " + describe_plan(tick.price, cfg))
-                out(f"<b>🟢 ENTRÉE simulée {sym}</b> ({ex}) @ {tick.price:.8g}\n{describe_plan(tick.price, cfg)}")
+                pos = ListingPosition(tick.price, args.size, cfg, args.slippage)
+                lat = f" | délai exchange->réception {(tick.recv_ts - tick.exch_ts) * 1000:.0f} ms" if tick.exch_ts else ""
+                print(f"[{ts()}] 🟢 ENTRÉE simulée {sym} — 1er tick {tick.price:.8g} ({tick.kind}) → exécutée "
+                      f"{pos.entry:.8g} (+{args.slippage:g}% slippage), mise {args.size:g}$, feed {stats.mode}{lat}")
+                print("          " + describe_plan(pos.entry, cfg))
+                out(f"<b>🟢 ENTRÉE simulée {sym}</b> ({ex}) @ {pos.entry:.8g}\n{describe_plan(pos.entry, cfg)}")
                 continue
             for a in pos.on_price(tick.price):
                 realized += a.fraction * a.price / pos.entry
                 icon = {"TP1": "🎯", "TP2": "🚀", "STOP": "🛑", "TRAILING_STOP": "🔒"}[a.kind]
-                line = (f"{icon} {a.kind} @ {a.price:.8g} ({a.price / pos.entry:.2f}x) — vend {a.fraction:.0%} "
-                        f"— {a.note} — reste {pos.remaining:.0%}")
+                line = (f"{icon} {a.kind} tick {a.tick_price:.8g} → exécuté {a.price:.8g} ({a.price / pos.entry:.2f}x) "
+                        f"— vend {a.fraction:.0%} — {a.note} — reste {pos.remaining:.0%}")
                 print(f"[{ts()}] {line}")
                 out(f"<b>{sym}</b> {line}")
             if pos.closed:
                 break
             if time.time() - last_status >= args.status_every:
                 last_status = time.time()
-                print(f"[{ts()}] · {tick.price:.8g} ({tick.price / pos.entry:.2f}x) pic {pos.peak / pos.entry:.2f}x "
+                print(f"[{ts()}] · tick {tick.price:.8g} ({tick.price / pos.entry:.2f}x fill) pic {pos.peak / pos.entry:.2f}x "
                       f"stop {pos.stop / pos.entry:.2f}x reste {pos.remaining:.0%} PnL {_pnl(pos, realized, tick.price):+.1f}%")
-            if args.duration and time.time() - t_start > args.duration:
-                print(f"[{ts()}] Durée max atteinte ({args.duration}s)")
+            if args.duration and elapsed > args.duration:
+                print(f"[{ts()}] Durée max atteinte ({args.duration:g}s)")
                 break
     except KeyboardInterrupt:
         print("\nArrêt manuel.")
     except RuntimeError as e:
         print(f"[feed] {e}")
+    finally:
+        if recorder:
+            recorder.close()
+            print(f"Enregistrement: {recorder.n} ticks -> {args.record}")
 
     print("\n=== Résumé de la simulation ===")
     if pos:
         final = (realized - 1) * 100 if pos.closed else _pnl(pos, realized, tick.price)
-        print(f"Entrée {pos.entry:.8g} | plus haut {pos.peak / pos.entry:.2f}x | "
-              f"TP1 {'oui' if pos.tp1_hit else 'non'} | TP2 {'oui' if pos.tp2_hit else 'non'} | "
-              f"{'clôturée' if pos.closed else f'ouverte ({pos.remaining:.0%})'} | "
+        print(f"Slippage {args.slippage:g}% | tick d'entrée {pos.tick_entry:.8g} → fill {pos.entry:.8g} | "
+              f"plus haut {pos.peak / pos.entry:.2f}x | TP1 {'oui' if pos.tp1_hit else 'non'} | "
+              f"TP2 {'oui' if pos.tp2_hit else 'non'} | "
+              f"{'clôturée' if pos.closed else f'ouverte ({pos.remaining:.0%}, valorisée à la sortie simulée)'} | "
               f"PnL simulé {final:+.1f}% ({args.size * final / 100:+.2f}$ sur {args.size:g}$)")
-        out(f"<b>Résumé {sym}</b> : PnL simulé {final:+.1f}% (plus haut {pos.peak / pos.entry:.2f}x)")
+        out(f"<b>Résumé {sym}</b> : PnL simulé {final:+.1f}% (plus haut {pos.peak / pos.entry:.2f}x, slippage {args.slippage:g}%)")
     else:
         print("Aucun tick reçu.")
     lat = f"{sum(stats.lat_ms) / len(stats.lat_ms):.0f} ms moy." if stats.lat_ms else "n/a"
+    ready = f" | WS prêt (connexion+abonnement) {stats.ws_ready_ms:.0f} ms" if stats.ws_ready_ms else ""
+    first = f" | 1er tick après {stats.first_tick_ts - t_start:.2f}s" if stats.first_tick_ts else ""
     print(f"Feed: {stats.mode} | {stats.ticks} ticks | reconnexions {stats.reconnects} | "
-          f"plus grand silence {stats.max_gap:.2f}s | latence reçue-vs-exchange {lat}")
+          f"plus grand silence {stats.max_gap:.2f}s | latence reçue-vs-exchange {lat}{ready}{first}")
 
 
 def cmd_audit(args) -> None:
@@ -459,8 +515,8 @@ def main() -> None:
     a.add_argument("chain_id")
     a.add_argument("address")
     m = sub.add_parser("monitor", help="flux de prix temps réel + exécution simulée du plan")
-    m.add_argument("exchange", help="gate | kucoin | okx | mock (flux simulé)")
-    m.add_argument("symbol")
+    m.add_argument("exchange", help="gate | kucoin | okx | mock (flux simulé) | replay (rejeu d'un fichier)")
+    m.add_argument("symbol", help="symbole, ou chemin du fichier si exchange=replay")
     m.add_argument("--mode", choices=["auto", "ws", "rest"], default="auto")
     m.add_argument("--interval", type=float, default=0.5, help="période REST (s) / vitesse du mock")
     m.add_argument("--poll", type=float, default=0.5, help="période de sonde avant la cotation (s)")
@@ -470,6 +526,9 @@ def main() -> None:
     m.add_argument("--status-every", type=float, default=5.0)
     m.add_argument("--notify", action="store_true", help="envoie aussi les événements sur Telegram")
     m.add_argument("--dry-run", action="store_true")
+    m.add_argument("--slippage", type=float, default=5.0, help="pénalité de slippage en %% (achat +x%%, vente -x%%)")
+    m.add_argument("--record", metavar="FICHIER.json", help="enregistre chaque tick (ts ms, prix, volume…)")
+    m.add_argument("--speed", type=float, default=1.0, help="vitesse de rejeu (exchange=replay ; 0 = instantané)")
     sub.add_parser("simulate")
     args = p.parse_args()
     handlers = {"audit": cmd_audit, "simulate": cmd_simulate, "monitor": cmd_monitor, "watch": cmd_watch}
