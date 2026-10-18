@@ -374,5 +374,6 @@ def stream_replay(path: str, speed: float = 1.0) -> Iterator[Tick]:
         if prev is not None and speed > 0:
             time.sleep(max(0.0, (r["ts_ms"] - prev) / 1000 / speed))
         prev = r["ts_ms"]
-        yield Tick(r["price"], time.time(), (r["exch_ts_ms"] or 0) / 1000 or None, r.get("volume") or 0.0,
+        yield Tick(r["price"], r["ts_ms"] / 1000, (r["exch_ts_ms"] or 0) / 1000 or None,   # recv_ts d'origine : latence/silences fidèles
+                   r.get("volume") or 0.0,
                    r.get("kind") or "price", r.get("bid"), r.get("ask"))
